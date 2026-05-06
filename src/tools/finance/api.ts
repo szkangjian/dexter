@@ -1,7 +1,22 @@
 import { readCache, writeCache, describeRequest } from '../../utils/cache.js';
 import { logger } from '../../utils/logger.js';
+import { finnhubGet, FINNHUB_SUPPORTED_ENDPOINTS, isFinnhubAvailable } from './finnhub-api.js';
+import { edgarGet, edgarSupports } from './sec-edgar-api.js';
 
 const BASE_URL = 'https://api.financialdatasets.ai';
+
+/**
+ * Finnhub is preferred when its key is set (broader free-tier coverage than
+ * the Financial Datasets free tier, which is restricted to 5 mega-cap tickers).
+ * Set FINANCE_PROVIDER=financialdatasets to force Financial Datasets.
+ */
+function shouldUseFinnhub(endpoint: string): boolean {
+  const forced = (process.env.FINANCE_PROVIDER ?? '').toLowerCase();
+  if (forced === 'financialdatasets' || forced === 'fd') return false;
+  if (forced === 'finnhub') return isFinnhubAvailable() && FINNHUB_SUPPORTED_ENDPOINTS.has(endpoint);
+  // Default: prefer Finnhub when its key is set and the endpoint is supported.
+  return isFinnhubAvailable() && FINNHUB_SUPPORTED_ENDPOINTS.has(endpoint);
+}
 
 export interface ApiResponse {
   data: Record<string, unknown>;
@@ -96,11 +111,38 @@ export const api = {
   ): Promise<ApiResponse> {
     const label = describeRequest(endpoint, params);
 
+    // Route to Finnhub when preferred and supported. Falls back to FD on Finnhub error.
+    if (shouldUseFinnhub(endpoint)) {
+      try {
+        return await finnhubGet(endpoint, params, options);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`[Finance API] Finnhub failed for ${label}, falling back to Financial Datasets — ${msg}`);
+      }
+    }
+
     // Check local cache first — avoids redundant network calls for immutable data
     if (options?.cacheable) {
       const cached = readCache(endpoint, params, options.ttlMs);
       if (cached) {
         return cached;
+      }
+    }
+
+    // SEC EDGAR fallback for /filings/ — try EDGAR first, only hit FD if EDGAR
+    // fails. EDGAR is free, no key, authoritative, no per-ticker gating.
+    // FD's value-add is /filings/items/ (pre-extracted sections); for that
+    // endpoint we still try FD first (below) and fall back to EDGAR's stub.
+    if (endpoint === '/filings/') {
+      try {
+        const edgarResult = await edgarGet(endpoint, params);
+        if (options?.cacheable) {
+          writeCache(endpoint, params, edgarResult.data as Record<string, unknown>, edgarResult.url);
+        }
+        return edgarResult;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`[Finance API] EDGAR failed for ${label}, falling back to Financial Datasets — ${msg}`);
       }
     }
 
@@ -117,7 +159,19 @@ export const api = {
       }
     }
 
-    const data = await executeRequest(url.toString(), label, {});
+    let data: Record<string, unknown>;
+    try {
+      data = await executeRequest(url.toString(), label, {});
+    } catch (fdErr) {
+      // Last-resort EDGAR fallback for filings endpoints. We've already tried
+      // EDGAR-first for /filings/ above; this catches the items endpoint.
+      if (edgarSupports(endpoint)) {
+        const msg = fdErr instanceof Error ? fdErr.message : String(fdErr);
+        logger.warn(`[Finance API] FD failed for ${label}, falling back to EDGAR — ${msg}`);
+        return await edgarGet(endpoint, params);
+      }
+      throw fdErr;
+    }
 
     // Persist for future requests when the caller marked the response as cacheable
     if (options?.cacheable) {

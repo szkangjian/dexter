@@ -41,10 +41,15 @@ const FilingsInputSchema = z.object({
     .string()
     .describe("The stock ticker symbol to fetch filings for. For example, 'AAPL' for Apple."),
   filing_type: z
-    .array(z.enum(['10-K', '10-Q', '8-K']))
+    .array(z.enum([
+      '10-K', '10-Q', '8-K',
+      '20-F', '40-F', '6-K',
+      'NPORT-P', 'N-CSR', 'N-CSRS',
+      '497', '485BPOS',
+    ]))
     .optional()
     .describe(
-      "Optional list of filing types to filter by. Use one or more of '10-K', '10-Q', or '8-K'. If omitted, returns most recent filings of ANY type."
+      "Optional list of filing types. Operating companies: 10-K/10-Q/8-K. Foreign filers: 20-F/40-F/6-K. ETFs and 1940-Act funds: NPORT-P (holdings), N-CSR (semi-annual report), 497/485BPOS (prospectus)."
     ),
   limit: z
     .number()

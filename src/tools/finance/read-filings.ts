@@ -6,6 +6,7 @@ import { callLlm } from '../../model/llm.js';
 import { formatToolResult } from '../types.js';
 import { getCurrentDate } from '../../agent/prompts.js';
 import { getFilings, get10KFilingItems, get10QFilingItems, get8KFilingItems, getFilingItemTypes, type FilingItemTypes } from './filings.js';
+import { fetchNportHoldings } from './sec-edgar-api.js';
 import { withTimeout, SUB_TOOL_TIMEOUT_MS } from './utils.js';
 
 /**
@@ -45,7 +46,12 @@ function escapeTemplateVars(str: string): string {
   return str.replace(/\{/g, '{{').replace(/\}/g, '}}');
 }
 
-const FilingTypeSchema = z.enum(['10-K', '10-Q', '8-K']);
+const FilingTypeSchema = z.enum([
+  '10-K', '10-Q', '8-K',         // operating-company forms
+  '20-F', '40-F', '6-K',          // foreign filers (e.g. Cameco files 40-F)
+  'NPORT-P', 'N-CSR', 'N-CSRS',   // 1940-Act funds (ETF holdings reports)
+  '497', '485BPOS',               // fund prospectus / shelf
+]);
 
 const FilingPlanSchema = z.object({
   ticker: z
@@ -90,11 +96,13 @@ Given a user query about SEC filings, return structured plan fields:
    - Google/Alphabet → GOOGL, Meta/Facebook → META, Nvidia → NVDA
 
 2. **Filing Type Inference**:
-   - Risk factors, business description, annual data → 10-K
-   - Quarterly results, recent performance → 10-Q
+   - Risk factors, business description, annual data → 10-K (US) / 20-F (foreign) / 40-F (Canadian)
+   - Quarterly results, recent performance → 10-Q (US) / 6-K (foreign)
    - Material events, acquisitions, earnings announcements → 8-K
-   - If a query spans multiple time horizons or intents, include multiple filing types
-   - If the query is broad, include all relevant filing types instead of leaving this empty
+   - **ETF / mutual fund holdings, "持仓", "组合" → NPORT-P** (quarterly portfolio report) and/or **N-CSR** (semi-annual fund report)
+   - **Fund prospectus, expense ratio, "招募说明书" → 497 / 485BPOS**
+   - If unsure whether the ticker is an operating company or a fund, include BOTH 10-K AND NPORT-P
+   - If the query spans multiple intents, include multiple filing types
 
 3. **Limit**: Default to 10 unless query specifies otherwise
 
@@ -243,6 +251,73 @@ export function createReadFilings(model: string): DynamicStructuredTool {
 
       const filingCount = filingsResult.data.length;
       onProgress?.(`Found ${filingCount} filing${filingCount !== 1 ? 's' : ''}, selecting content to read...`);
+
+      // Short-circuit for non-section forms: 10-K/10-Q/8-K have named items
+      // (Item-1A, Item-7, etc.) that FD pre-extracts. Forms like NPORT-P,
+      // N-CSR, 497 are single-document XBRL/HTML — there's no item granularity
+      // to choose from. NPORT-P specifically: parse the XBRL into structured
+      // holdings here so the agent gets actionable data on round 1.
+      const SECTION_FORMS = new Set(['10-K', '10-K/A', '10-Q', '10-Q/A', '8-K', '8-K/A']);
+      const allNonSection = filingsResult.data.every((f: unknown) => {
+        const ft = (f as { filing_type?: string })?.filing_type;
+        return ft !== undefined && !SECTION_FORMS.has(ft);
+      });
+      if (allNonSection) {
+        // Auto-parse NPORT-P XBRL → structured holdings for the most recent filing
+        const nportFiling = filingsResult.data.find((f: unknown) => {
+          const ft = (f as { filing_type?: string })?.filing_type;
+          return ft === 'NPORT-P';
+        }) as { document_url?: string; accession_number?: string; period_of_report?: string } | undefined;
+
+        if (nportFiling?.document_url && nportFiling.accession_number) {
+          // Extract CIK from the document URL: /Archives/edgar/data/{CIK}/...
+          const cikMatch = /\/data\/(\d+)\//.exec(nportFiling.document_url);
+          if (cikMatch) {
+            try {
+              onProgress?.(`Parsing NPORT-P holdings (period ${nportFiling.period_of_report ?? 'recent'})...`);
+              const holdings = await fetchNportHoldings(cikMatch[1], nportFiling.accession_number);
+              return formatToolResult(
+                {
+                  mode: 'nport-holdings',
+                  filing: nportFiling,
+                  fund_info: {
+                    filer: holdings.filer,
+                    fund: holdings.fund,
+                    period_of_report: holdings.period_of_report,
+                    total_assets_usd: holdings.total_assets_usd,
+                    total_liabilities_usd: holdings.total_liabilities_usd,
+                    net_assets_usd: holdings.net_assets_usd,
+                  },
+                  holdings_count: holdings.holdings_count,
+                  // Cap at top 50 — full list can be 100+; agent can ask for more.
+                  top_holdings: holdings.holdings.slice(0, 50),
+                  other_filings: filingsResult.data.filter(f => f !== nportFiling),
+                },
+                filingsResult.sourceUrls,
+              );
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              return formatToolResult(
+                {
+                  mode: 'document-list',
+                  note: `NPORT-P parse failed (${msg}). Falling back to document URLs — caller should web_fetch.`,
+                  filings: filingsResult.data,
+                },
+                filingsResult.sourceUrls,
+              );
+            }
+          }
+        }
+
+        return formatToolResult(
+          {
+            mode: 'document-list',
+            note: 'These filings (N-CSR, 497, 6-K, 40-F, etc.) are single documents without named sections. To read content, call web_fetch on document_url.',
+            filings: filingsResult.data,
+          },
+          filingsResult.sourceUrls,
+        );
+      }
 
       // Step 2: Select and read filing content with canonical item names
       const { response: step2Response } = await callLlm('Select and call the appropriate filing item tools.', {

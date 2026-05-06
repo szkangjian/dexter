@@ -93,6 +93,26 @@ const DEFAULT_ERROR_MAX_CHARS = 4_000;
 const DEFAULT_FETCH_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
+/**
+ * SEC EDGAR's fair-access policy blocks generic browser UAs on /Archives/
+ * with 403. They require a UA that identifies the requester with a contact.
+ * Override via SEC_EDGAR_USER_AGENT env var to identify yourself differently.
+ */
+const SEC_EDGAR_USER_AGENT = process.env.SEC_EDGAR_USER_AGENT
+  || "Dexter Research Agent kangjian.sz@gmail.com";
+
+function pickUserAgent(url: string): string {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    if (host === 'www.sec.gov' || host === 'sec.gov' || host.endsWith('.sec.gov')) {
+      return SEC_EDGAR_USER_AGENT;
+    }
+  } catch {
+    // fall through
+  }
+  return DEFAULT_FETCH_USER_AGENT;
+}
+
 // ============================================================================
 // Cache (identical to OpenClaw)
 // ============================================================================
@@ -413,7 +433,7 @@ export const webFetchTool = new DynamicStructuredTool({
       maxRedirects: DEFAULT_FETCH_MAX_REDIRECTS,
       timeoutSeconds: resolveTimeoutSeconds(undefined, DEFAULT_TIMEOUT_SECONDS),
       cacheTtlMs: resolveCacheTtlMs(undefined, DEFAULT_CACHE_TTL_MINUTES),
-      userAgent: DEFAULT_FETCH_USER_AGENT,
+      userAgent: pickUserAgent(input.url),
     });
     return formatToolResult(result, [input.url]);
   },
