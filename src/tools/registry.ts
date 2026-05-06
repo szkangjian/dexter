@@ -14,6 +14,7 @@ import { SCREEN_STOCKS_DESCRIPTION } from './finance/screen-stocks.js';
 import { heartbeatTool, HEARTBEAT_TOOL_DESCRIPTION } from './heartbeat/heartbeat-tool.js';
 import { cronTool, CRON_TOOL_DESCRIPTION } from './cron/cron-tool.js';
 import { memoryGetTool, MEMORY_GET_DESCRIPTION, memorySearchTool, MEMORY_SEARCH_DESCRIPTION, memoryUpdateTool, MEMORY_UPDATE_DESCRIPTION } from './memory/index.js';
+import { ibTool, IB_TOOL_DESCRIPTION } from './ib/ib-tool.js';
 import { discoverSkills } from '../skills/index.js';
 
 /**
@@ -174,6 +175,19 @@ export function getToolRegistry(model: string): RegisteredTool[] {
       tool: xSearchTool,
       description: X_SEARCH_DESCRIPTION,
       compactDescription: 'Search X/Twitter for tweets, profiles, and threads.',
+      concurrencySafe: true,
+    });
+  }
+
+  // IB portfolio bridge — registered when IB_BRIDGE_URL is set OR the user
+  // explicitly opts in via IB_BRIDGE_ENABLED. We don't ping the bridge here
+  // (registry build is sync); the tool itself handles the unreachable case.
+  if (process.env.IB_BRIDGE_URL || process.env.IB_BRIDGE_ENABLED === '1') {
+    tools.push({
+      name: 'ib_portfolio',
+      tool: ibTool,
+      description: IB_TOOL_DESCRIPTION,
+      compactDescription: 'Query the user\'s real Interactive Brokers portfolio (positions, option chain, spot) via local bridge. Read-only.',
       concurrencySafe: true,
     });
   }
